@@ -8,12 +8,11 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import os
-import re
 import secrets
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from polestar_api import PolestarApi
+from polestar_api import PolestarApi, Vehicle
 
 # All credentials are server-side environment variables, never in index.html.
 POLESTAR_EMAIL = os.environ.get("POLESTAR_EMAIL", "")
@@ -28,6 +27,8 @@ if not HOME_OS_API_KEY or len(HOME_OS_API_KEY) < 24:
     raise RuntimeError("Set HOME_OS_API_KEY to a random value of at least 24 characters")
 if not POLESTAR_EMAIL or not POLESTAR_PASSWORD:
     raise RuntimeError("Set POLESTAR_EMAIL and POLESTAR_PASSWORD as server-side secrets")
+if POLESTAR_VIN and len(POLESTAR_VIN) != 17:
+    raise RuntimeError("POLESTAR_VIN must be the full 17-character VIN")
 
 app = FastAPI(title="HOME OS Polestar bridge", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
@@ -63,26 +64,47 @@ def _enum_text(value) -> str | None:
 
 
 async def _fetch_vehicle():
-    """Fetch only the data displayed on HOME OS. No remote vehicle commands."""
-    # Temporary diagnostic markers. No tokens, passwords, or vehicle identifiers logged.
-    logger.warning("Polestar diagnostic: starting authentication and endpoint discovery")
+    """Fetch read-only vehicle data; allow VIN fallback for linked accounts.
+
+    The API's get_vehicle(vin) only searches get_vehicles(), which can be
+    empty for guest/linked accounts. The upstream Home Assistant integration
+    instead constructs Vehicle(vin, connection) directly as a fallback.
+    This uses a private library connection attribute and may require an
+    update if the unofficial package changes its internals.
+    """
+    logger.info("Polestar diagnostic: starting authentication and endpoint discovery")
     async with PolestarApi(email=POLESTAR_EMAIL, password=POLESTAR_PASSWORD) as api:
-        logger.warning("Polestar diagnostic: authentication and endpoint discovery completed")
+        logger.info("Polestar diagnostic: authentication and endpoint discovery completed")
         if POLESTAR_VIN:
-            logger.warning("Polestar diagnostic: looking up configured vehicle")
-            vehicle = await api.get_vehicle(POLESTAR_VIN)
+            logger.info("Polestar diagnostic: requesting vehicle list for configured VIN")
+            try:
+                vehicles = await api.get_vehicles()
+                logger.info("Polestar diagnostic: vehicle list returned (%d vehicles)", len(vehicles))
+            except Exception as exc:
+                # Manual VIN fallback can work when vehicle discovery is unavailable.
+                logger.warning("Polestar diagnostic: listing failed (%s); testing VIN directly", type(exc).__name__)
+                vehicles = []
+
+            vehicle = next((v for v in vehicles if v.vin == POLESTAR_VIN), None)
+            if vehicle is None:
+                logger.info("Polestar diagnostic: VIN absent from list; trying direct vehicle connection")
+                connection = api._connection  # Matches upstream HA integration's VIN fallback.
+                if connection is None:
+                    raise RuntimeError("No Polestar connection after authentication")
+                vehicle = Vehicle(vin=POLESTAR_VIN, connection=connection)
         else:
-            logger.warning("Polestar diagnostic: requesting vehicle list")
+            logger.info("Polestar diagnostic: requesting vehicle list")
             vehicles = await api.get_vehicles()
-            logger.warning("Polestar diagnostic: vehicle list returned (%d vehicles)", len(vehicles))
+            logger.info("Polestar diagnostic: vehicle list returned (%d vehicles)", len(vehicles))
             if not vehicles:
-                raise RuntimeError("No vehicle available in this Polestar account")
+                raise RuntimeError("No vehicles listed; configure POLESTAR_VIN to test direct connection")
             vehicle = vehicles[0]
-        logger.warning("Polestar diagnostic: requesting battery data")
+
+        logger.info("Polestar diagnostic: requesting battery status")
         battery = await vehicle.get_battery()
-        logger.warning("Polestar diagnostic: battery request completed (has data: %s)", battery is not None)
         if battery is None:
-            raise RuntimeError("Polestar did not return battery data for this vehicle")
+            raise RuntimeError("Polestar returned no battery data for this VIN")
+        logger.info("Polestar diagnostic: battery status received")
         return {
             "soc_percent": round(float(battery.charge_level)),
             "range_km": round(float(battery.range_km)),
@@ -93,44 +115,6 @@ async def _fetch_vehicle():
             "source": "polestar",
             "stale": False,
         }
-
-
-def _safe_polestar_failure(exc: Exception) -> str:
-    """Describe known login failures without logging credentials, tokens or redirect URLs.
-
-    Some AuthError messages include a full redirect URL. Never log the raw
-    exception message because those URLs can contain authentication codes.
-    """
-    name = type(exc).__name__
-    if name == "AuthError":
-        message = str(exc)
-        if message == "Invalid username or password":
-            return "AuthError: credentials rejected by Polestar"
-        if message.startswith("Could not find resume path in auth response"):
-            match = re.search(r"status (\d{3})", message)
-            status = match.group(1) if match else "unknown"
-            return f"AuthError: unexpected login page (HTTP {status}); login flow may have changed or been blocked"
-        if message.startswith("Auth failed with status"):
-            match = re.search(r"status (\d{3})", message)
-            status = match.group(1) if match else "unknown"
-            return f"AuthError: credential submission returned HTTP {status}"
-        if message.startswith("No auth code in redirect"):
-            return "AuthError: no authorization code after login (redirect/consent/verification flow)"
-        if message.startswith("Token refresh failed"):
-            match = re.search(r"(\d{3})", message)
-            status = match.group(1) if match else "unknown"
-            return f"AuthError: token refresh returned HTTP {status}"
-        if message == "Not authenticated":
-            return "AuthError: no active authentication session"
-        return "AuthError: other authentication problem (details hidden to protect tokens)"
-    if isinstance(exc, asyncio.TimeoutError):
-        return "TimeoutError: Polestar request took too long"
-    if isinstance(exc, RuntimeError):
-        if str(exc) == "No vehicle available in this Polestar account":
-            return "RuntimeError: authentication succeeded, but vehicle list was empty"
-        if str(exc) == "Polestar did not return battery data for this vehicle":
-            return "RuntimeError: vehicle found, but battery data was unavailable"
-    return f"{name}: request unsuccessful (details hidden)"
 
 
 @app.get("/api/vehicle")
@@ -149,7 +133,7 @@ async def vehicle(authorization: str | None = Header(default=None)):
         except Exception as exc:
             # Do not include raw Polestar exceptions in HTTP responses: they may
             # contain private information or implementation details.
-            logger.warning("Polestar request failed: %s", _safe_polestar_failure(exc))
+            logger.warning("Polestar request failed: %s", type(exc).__name__)
             if _cache is not None:
                 return {**_cache, "stale": True}
             raise HTTPException(status_code=503, detail="Polestar data temporarily unavailable") from None
