@@ -64,15 +64,23 @@ def _enum_text(value) -> str | None:
 
 async def _fetch_vehicle():
     """Fetch only the data displayed on HOME OS. No remote vehicle commands."""
+    # Temporary diagnostic markers. No tokens, passwords, or vehicle identifiers logged.
+    logger.warning("Polestar diagnostic: starting authentication and endpoint discovery")
     async with PolestarApi(email=POLESTAR_EMAIL, password=POLESTAR_PASSWORD) as api:
+        logger.warning("Polestar diagnostic: authentication and endpoint discovery completed")
         if POLESTAR_VIN:
-            vehicle = api.get_vehicle(POLESTAR_VIN)
+            logger.warning("Polestar diagnostic: looking up configured vehicle")
+            vehicle = await api.get_vehicle(POLESTAR_VIN)
         else:
+            logger.warning("Polestar diagnostic: requesting vehicle list")
             vehicles = await api.get_vehicles()
+            logger.warning("Polestar diagnostic: vehicle list returned (%d vehicles)", len(vehicles))
             if not vehicles:
                 raise RuntimeError("No vehicle available in this Polestar account")
             vehicle = vehicles[0]
+        logger.warning("Polestar diagnostic: requesting battery data")
         battery = await vehicle.get_battery()
+        logger.warning("Polestar diagnostic: battery request completed (has data: %s)", battery is not None)
         if battery is None:
             raise RuntimeError("Polestar did not return battery data for this vehicle")
         return {
@@ -117,6 +125,11 @@ def _safe_polestar_failure(exc: Exception) -> str:
         return "AuthError: other authentication problem (details hidden to protect tokens)"
     if isinstance(exc, asyncio.TimeoutError):
         return "TimeoutError: Polestar request took too long"
+    if isinstance(exc, RuntimeError):
+        if str(exc) == "No vehicle available in this Polestar account":
+            return "RuntimeError: authentication succeeded, but vehicle list was empty"
+        if str(exc) == "Polestar did not return battery data for this vehicle":
+            return "RuntimeError: vehicle found, but battery data was unavailable"
     return f"{name}: request unsuccessful (details hidden)"
 
 
