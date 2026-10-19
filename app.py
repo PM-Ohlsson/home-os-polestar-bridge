@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import os
+import re
 import secrets
 
 from fastapi import FastAPI, Header, HTTPException
@@ -86,6 +87,39 @@ async def _fetch_vehicle():
         }
 
 
+def _safe_polestar_failure(exc: Exception) -> str:
+    """Describe known login failures without logging credentials, tokens or redirect URLs.
+
+    Some AuthError messages include a full redirect URL. Never log the raw
+    exception message because those URLs can contain authentication codes.
+    """
+    name = type(exc).__name__
+    if name == "AuthError":
+        message = str(exc)
+        if message == "Invalid username or password":
+            return "AuthError: credentials rejected by Polestar"
+        if message.startswith("Could not find resume path in auth response"):
+            match = re.search(r"status (\d{3})", message)
+            status = match.group(1) if match else "unknown"
+            return f"AuthError: unexpected login page (HTTP {status}); login flow may have changed or been blocked"
+        if message.startswith("Auth failed with status"):
+            match = re.search(r"status (\d{3})", message)
+            status = match.group(1) if match else "unknown"
+            return f"AuthError: credential submission returned HTTP {status}"
+        if message.startswith("No auth code in redirect"):
+            return "AuthError: no authorization code after login (redirect/consent/verification flow)"
+        if message.startswith("Token refresh failed"):
+            match = re.search(r"(\d{3})", message)
+            status = match.group(1) if match else "unknown"
+            return f"AuthError: token refresh returned HTTP {status}"
+        if message == "Not authenticated":
+            return "AuthError: no active authentication session"
+        return "AuthError: other authentication problem (details hidden to protect tokens)"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "TimeoutError: Polestar request took too long"
+    return f"{name}: request unsuccessful (details hidden)"
+
+
 @app.get("/api/vehicle")
 async def vehicle(authorization: str | None = Header(default=None)):
     global _cache, _cache_time
@@ -102,7 +136,7 @@ async def vehicle(authorization: str | None = Header(default=None)):
         except Exception as exc:
             # Do not include raw Polestar exceptions in HTTP responses: they may
             # contain private information or implementation details.
-            logger.warning("Polestar request failed: %s", type(exc).__name__)
+            logger.warning("Polestar request failed: %s", _safe_polestar_failure(exc))
             if _cache is not None:
                 return {**_cache, "stale": True}
             raise HTTPException(status_code=503, detail="Polestar data temporarily unavailable") from None
